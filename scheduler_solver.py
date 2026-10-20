@@ -1,7 +1,6 @@
 from collections.abc import Callable
-from functools import partial
 from pprint import pprint
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from ortools.sat.python import cp_model
 
@@ -11,7 +10,38 @@ from ortools.sat.python import cp_model
 
 
 _VERBOSE = False
-_FULLFILLMENT_SCALE = 1000
+_FULFILLMENT_SCALE = 1000
+_MAX_AVAILABILITY_SCORE = 4
+ObjectiveName = Literal[
+    "coverage",
+    "best_slot",
+    "minimum_fulfillment",
+    "activities",
+    "total_attendance",
+    "total_preference",
+]
+# Per slot, either {person: score} or a frozenset of people who all get the top
+# score.
+AvailabilityInput = dict[str, dict[str, int] | frozenset[str]]
+
+
+# ==========================================================
+# Input Normalization
+# ==========================================================
+
+
+def _normalize_availability(
+    availability: AvailabilityInput,
+) -> dict[str, dict[str, int]]:
+    """Convert frozenset-valued slots to {person: max score} dicts."""
+    return {
+        slot: (
+            people
+            if isinstance(people, dict)
+            else dict.fromkeys(people, _MAX_AVAILABILITY_SCORE)
+        )
+        for slot, people in availability.items()
+    }
 
 
 # ==========================================================
@@ -28,20 +58,26 @@ def _validate_capacity(capacity: dict[str, int]) -> None:
 
 
 def _validate_availability(
-    availability: dict[str, frozenset[str]], capacity: dict[str, int]
+    availability: dict[str, dict[str, int]], capacity: dict[str, int]
 ) -> None:
-    for slot, available_people in availability.items():
+    for slot, person_scores in availability.items():
         if not slot.strip():
             raise ValueError("availability keys must not be empty")
-        if any(not person.strip() for person in available_people):
+        if any(not person.strip() for person in person_scores):
             raise ValueError(
                 f"availability for slot {slot!r} contains an empty person name"
             )
+        for person, score in person_scores.items():
+            if not 0 <= score <= _MAX_AVAILABILITY_SCORE:
+                raise ValueError(
+                    f"availability score for {person!r} at {slot!r} must be "
+                    f"between 0 and {_MAX_AVAILABILITY_SCORE}"
+                )
 
     unknown_people = {
         person
-        for available_people in availability.values()
-        for person in available_people
+        for person_scores in availability.values()
+        for person in person_scores
         if person not in capacity
     }
     if unknown_people:
@@ -62,7 +98,7 @@ def _validate_min_people(min_people: int, capacity: dict[str, int]) -> None:
 
 
 def _validate_groups(
-    availability: dict[str, frozenset[str]], groups: frozenset[frozenset[str]] | None
+    availability: dict[str, dict[str, int]], groups: frozenset[frozenset[str]] | None
 ) -> None:
     if groups is None:
         return
@@ -90,17 +126,9 @@ def _validate_groups(
 
 
 def _validate_objective_order(
-    objective_order: tuple[
-        Literal["coverage", "minimum_fulfillment", "activities", "total_assignments"],
-        ...,
-    ],
+    objective_order: tuple[ObjectiveName, ...],
 ) -> None:
-    valid_objectives = {
-        "coverage",
-        "minimum_fulfillment",
-        "activities",
-        "total_assignments",
-    }
+    valid_objectives = get_args(ObjectiveName)
     if (
         not objective_order
         or len(objective_order) != len(set(objective_order))
@@ -108,20 +136,16 @@ def _validate_objective_order(
     ):
         raise ValueError(
             "objective_order must contain one or more unique objectives from "
-            "'coverage', 'minimum_fulfillment', 'activities', and "
-            "'total_assignments'"
+            f"{', '.join(map(repr, valid_objectives))}"
         )
 
 
 def _validate_inputs(
-    availability: dict[str, frozenset[str]],
     capacity: dict[str, int],
+    availability: dict[str, dict[str, int]],
     min_people: int,
     groups: frozenset[frozenset[str]] | None,
-    objective_order: tuple[
-        Literal["coverage", "minimum_fulfillment", "activities", "total_assignments"],
-        ...,
-    ],
+    objective_order: tuple[ObjectiveName, ...],
 ) -> None:
     _validate_capacity(capacity)
     _validate_availability(availability, capacity)
@@ -131,8 +155,74 @@ def _validate_inputs(
 
 
 # ==========================================================
-# Result Collecting Functions
+# Result Functions
 # ==========================================================
+
+
+def _ideal_metrics(
+    capacity: dict[str, int], availability: dict[str, dict[str, int]]
+) -> dict[str, int]:
+    """Best values the input allows if every person got their favorite slots.
+
+    Ignores slot conflicts, groups, and min_people, so these are upper bounds
+    that a real schedule may not reach.
+    """
+    ideal = {
+        "coverage_ideal": 0,
+        "best_slot_ideal": 0,
+        "total_attendance_ideal": 0,
+        "total_preference_ideal": 0,
+    }
+    for person, limit in capacity.items():
+        scores = sorted(
+            (
+                person_scores[person]
+                for person_scores in availability.values()
+                if person_scores.get(person, 0) > 0
+            ),
+            reverse=True,
+        )[:limit]
+        if scores:
+            ideal["coverage_ideal"] += 1
+            ideal["best_slot_ideal"] += scores[0]
+            ideal["total_attendance_ideal"] += len(scores)
+            ideal["total_preference_ideal"] += sum(scores)
+    return ideal
+
+
+def _summarize(
+    participants: dict[str, list[str]],
+    capacity: dict[str, int],
+    availability: dict[str, dict[str, int]],
+) -> dict[str, Any]:
+    """Build a schedule result, computing every metric from the participants."""
+    attendance = {person: 0 for person in sorted(capacity)}
+    best_score = {person: 0 for person in sorted(capacity)}
+    for slot, attendees in participants.items():
+        for person in attendees:
+            attendance[person] += 1
+            best_score[person] = max(best_score[person], availability[slot][person])
+
+    covered = [person for person, count in attendance.items() if count > 0]
+    return {
+        "coverage_count": len(covered),
+        "best_slot_score": sum(best_score.values()),
+        "total_attendance": sum(attendance.values()),
+        "total_preference": sum(
+            availability[slot][person]
+            for slot, attendees in participants.items()
+            for person in attendees
+        ),
+        **_ideal_metrics(capacity, availability),
+        "minimum_fulfillment": min(
+            (attendance[person] / capacity[person] for person in covered),
+            default=0.0,
+        ),
+        "activity_count": len(participants),
+        "activities": list(participants),
+        "participation_count": attendance,
+        "participants": participants,
+    }
 
 
 def _filter_prefer_spread(schedules: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -158,71 +248,27 @@ def _filter_prefer_spread(schedules: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
-def _get_all_solutions(
+def _enumerate_solutions(
     model: cp_model.CpModel,
-    make_result: Callable[..., dict[str, Any]],
-    prefer_spread: bool,
-) -> list[dict[str, Any]]:
+    extract_participants: Callable[[Callable[..., int]], dict[str, list[str]]],
+) -> list[dict[str, list[str]]]:
+    """Return the participants of every feasible solution of `model`."""
     model.clear_objective()
 
-    class OptimalScheduleCollector(cp_model.CpSolverSolutionCallback):
+    class SolutionCollector(cp_model.CpSolverSolutionCallback):
         def __init__(self):
             super().__init__()
-            self.schedules = []
-            self.seen = set()
+            self.solutions = []
 
         def OnSolutionCallback(self):
-            result = make_result(self.value)
-            key = tuple(
-                (slot, tuple(result["participants"][slot]))
-                for slot in result["activities"]
-            )
-            if key not in self.seen:
-                self.seen.add(key)
-                self.schedules.append(result)
+            self.solutions.append(extract_participants(self.value))
 
-    collector = OptimalScheduleCollector()
+    collector = SolutionCollector()
     enumerator = cp_model.CpSolver()
     enumerator.parameters.enumerate_all_solutions = True
-    enumerator.parameters.num_search_workers = 1
+    enumerator.parameters.num_workers = 1
     enumerator.solve(model, collector)
-
-    if prefer_spread:
-        return _filter_prefer_spread(collector.schedules)
-
-    return collector.schedules
-
-
-def _make_result(
-    make_result: Callable[..., int],
-    *,
-    slots: list[str],
-    people: list[str],
-    activity_selected: dict[str, Any],
-    person_assigned: dict[tuple[str, str], Any],
-    participant_count: dict[str, Any],
-    person_covered: dict[str, Any],
-    min_fulfillment: Any,
-    total_assignments: Any,
-) -> dict[str, Any]:
-    selected_slots = [slot for slot in slots if make_result(activity_selected[slot])]
-    participants = {
-        slot: [
-            person for person in people if make_result(person_assigned[(person, slot)])
-        ]
-        for slot in selected_slots
-    }
-    return {
-        "activities": selected_slots,
-        "participants": participants,
-        "participation_count": {
-            person: make_result(participant_count[person]) for person in people
-        },
-        "activity_count": len(selected_slots),
-        "coverage_count": sum(make_result(person_covered[person]) for person in people),
-        "minimum_fulfillment": make_result(min_fulfillment) / _FULLFILLMENT_SCALE,
-        "total_assignments": make_result(total_assignments),
-    }
+    return collector.solutions
 
 
 # ==========================================================
@@ -231,38 +277,46 @@ def _make_result(
 
 
 def solve_schedule(
-    availability: dict[str, frozenset[str]],
     capacity: dict[str, int],
+    availability: AvailabilityInput,
     min_people: int,
     groups: frozenset[frozenset[str]] | None = None,
-    objective_order: tuple[
-        Literal["coverage", "minimum_fulfillment", "activities", "total_assignments"],
-        ...,
-    ] = ("coverage", "minimum_fulfillment", "activities", "total_assignments"),
+    objective_order: tuple[ObjectiveName, ...] = (
+        "coverage",
+        "best_slot",
+        "minimum_fulfillment",
+        "activities",
+        "total_attendance",
+        "total_preference",
+    ),
     return_all_solutions: bool = True,
     prefer_spread: bool = True,
-) -> dict[str, Any] | list[dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Optimize activity schedules subject to availability and capacity.
 
     Parameters
     ----------
-    availability : dict[str, frozenset[str]]
-        Maps each slot name to an immutable set of people available for it.
-        Every person named here must also appear in `capacity`.
-
-        Example:
-            {
-                "09-06 Fri": {"Mario", "Ana"},
-                "09-07 Sat": {"Mario", "Carlos"},
-                "09-08 Sun": {"Carlos", "Ana"},
-            }
-
     capacity : dict[str, int]
         Maps each person to their maximum number of activities. This is the
         authoritative list of valid people; values must be non-negative.
 
         Example:
             {"Mario": 2, "Carlos": 3, "Ana": 1}
+
+    availability : dict[str, dict[str, int] | frozenset[str]]
+        Maps each slot to per-person availability scores from 0 to 4. Zero means
+        unavailable; positive scores mean eligible, with 4 as the strongest
+        preference. People not mentioned for a slot count as 0. A slot may
+        instead map to a frozenset of names, meaning those people score 4 and
+        everyone else 0. Every person named here must also appear in
+        `capacity`.
+
+        Example:
+            {
+                "09-06 Fri": {"Mario": 4, "Ana": 2},
+                "09-07 Sat": {"Mario": 3, "Carlos": 4},
+                "09-08 Sun": frozenset({"Carlos", "Ana"}),
+            }
 
     min_people : int
         Minimum number of attendees required for every selected activity. Must
@@ -284,187 +338,198 @@ def solve_schedule(
         Non-empty ordered subset of the supported objectives. Each objective
         may appear once; objectives not listed are not optimized.
 
-        * "coverage": maximize the number of unique participants.
-        * "minimum_fulfillment": maximize the lowest assigned/capacity ratio
-          among covered participants.
-        * "activities": maximize the number of selected activities.
-        * "total_assignments": maximize the number of participant/activity
-          assignments.
+        * coverage: Include as many different people as possible, even if
+          some only get a slot they rated low. Nobody should be left out when
+          there is a way to fit them in.
+          Definition: maximize the number of people with at least one
+          assignment. Any positive score counts.
+        * best_slot: Give each person at least one slot they really like.
+          This raises the best slot each person gets, rather than giving extra
+          dates to people who already have a good one.
+          Definition: maximize the sum, over people, of the best score among
+          their assignments (0 if unassigned).
+        * minimum_fulfillment: Share activities fairly, so no participant
+          gets far fewer activities than they said they could attend.
+          Definition: maximize the lowest assigned/capacity ratio among
+          covered participants.
+        * activities: Hold as many activities as possible.
+          Definition: maximize the number of selected activities.
+        * total_attendance: Fill as many seats as possible across all
+          activities. Unlike coverage, repeat attendances by the same person
+          also count.
+          Definition: maximize the number of person/slot assignments.
+        * total_preference: Fill seats with people who rated those dates highly.
+          Like total_attendance, every attendance counts, but each one is
+          weighted by the person's score for that slot.
+          Definition: maximize the sum of scores over all assignments.
 
-        The default order is coverage, minimum fulfillment, activities, then
-        total assignments.
+        coverage and best_slot count each person once; total_attendance and
+        total_preference count every attendance. In each pair, the first counts
+        people and the second weights them by score. With binary 0/4 scores,
+        best_slot is 4x coverage and total_preference is 4x total_attendance.
+
+        The default order is coverage, best slot, minimum fulfillment,
+        activities, total attendance, then total preference.
 
     return_all_solutions : bool
         If true, return every schedule tied at the best objective values. If
-        false, return one schedule.
+        false, return a list with one optimal schedule.
 
     prefer_spread : bool
         When returning all optimal schedules, keep only those with the fewest
-        attendees repeated across consecutive selected activities.
+        attendees repeated across consecutive selected activities. Slots are
+        ordered by name, so names should sort chronologically.
 
     Returns
     -------
     list[dict[str, Any]]
         List of schedules containing participants, participation counts, and
-        objective metrics.
+        objective metrics. Keys ending in `_ideal` give, for comparison, the
+        best value of a metric if every person got their favorite slots up to
+        their capacity, ignoring all other constraints.
+
+    Raises
+    ------
+    ValueError
+        If the inputs are invalid.
+    RuntimeError
+        If the solver fails to prove an objective optimal. Valid inputs always
+        have a schedule (possibly with no activities), so this indicates a bug
+        or solver failure, not an impossible schedule.
     """
-    _validate_inputs(availability, capacity, min_people, groups, objective_order)
-    groups = groups or frozenset()
+    slot_scores = _normalize_availability(availability)
+    _validate_inputs(capacity, slot_scores, min_people, groups, objective_order)
+
+    people = sorted(capacity)
+    slots = sorted(slot_scores)
+
+    # Eligible (person, slot) pairs and their scores. A score of zero, an
+    # omitted person, or zero capacity means the person can never attend.
+    score = {
+        (p, s): slot_scores[s].get(p, 0)
+        for p in people
+        for s in slots
+        if slot_scores[s].get(p, 0) > 0 and capacity[p] > 0
+    }
+    slots_of = {p: [s for s in slots if (p, s) in score] for p in people}
+    people_of = {s: [p for p in people if (p, s) in score] for s in slots}
 
     model = cp_model.CpModel()
 
-    people = sorted(capacity.keys())
-    slots = sorted(availability.keys())
-
     # ==========================================================
-    # Variables
+    # Decision variables
     # ==========================================================
 
-    # Activity selected on slot
-    activity_selected = {s: model.new_bool_var(f"activity_{s}") for s in slots}
-
-    # Participation assignment
-    person_assigned = {}
-
-    for p in people:
-        for s in slots:
-            person_assigned[(p, s)] = model.new_bool_var(f"assign_{p}_{s}")
-
-    # Participates at least once
-    person_covered = {p: model.new_bool_var(f"covered_{p}") for p in people}
-
-    # Participation count per person
-    participation_count = {}
-
-    for p in people:
-        participation_count[p] = model.new_int_var(0, capacity[p], f"count_{p}")
-
-    # Minimum fulfillment
-    min_fulfillment = model.new_int_var(0, _FULLFILLMENT_SCALE, "min_fulfillment")
+    selected = {s: model.new_bool_var(f"selected_{s}") for s in slots}
+    assigned = {(p, s): model.new_bool_var(f"assigned_{p}_{s}") for p, s in score}
 
     # ==========================================================
-    # Availability constraints
+    # Constraints
     # ==========================================================
 
-    for p in people:
-        for s in slots:
-            # unavailable => cannot be assigned
-            if p not in availability[s]:
-                model.add(person_assigned[(p, s)] == 0)
+    # A person can only attend a selected activity.
+    for (_, s), is_assigned in assigned.items():
+        model.add(is_assigned <= selected[s])
 
-            # cannot participate if activity doesn't exist
-            model.add(person_assigned[(p, s)] <= activity_selected[s])
-
-    # ==========================================================
-    # Participation count and capacity
-    # ==========================================================
-
-    for p in people:
-        participation_sum = sum(person_assigned[(p, s)] for s in slots)
-
-        model.add(participation_count[p] == participation_sum)
-
-        model.add(participation_sum <= capacity[p])
-
-    # ==========================================================
-    # Coverage definition
-    # ==========================================================
-
-    M = len(slots)
-
-    for p in people:
-        model.add(participation_count[p] >= person_covered[p])
-        model.add(participation_count[p] <= M * person_covered[p])
-
-    # ==========================================================
-    # Minimum attendance
-    # ==========================================================
-
+    # Every selected activity needs at least min_people attendees.
     for s in slots:
-        attendees = sum(person_assigned[(p, s)] for p in people)
+        attendees = sum(assigned[(p, s)] for p in people_of[s])
+        model.add(attendees >= min_people * selected[s])
 
-        model.add(attendees >= min_people * activity_selected[s])
-
-    # ==========================================================
-    # One activity per group
-    # ==========================================================
-
-    if groups:
-        for group in groups:
-            valid_slots = [s for s in group if s in activity_selected]
-
-            if valid_slots:
-                model.add(sum(activity_selected[s] for s in valid_slots) <= 1)
-
-    # ==========================================================
-    # Fulfillment constraints: maximize the lowest assigned/capacity ratio.
-    # ==========================================================
-
+    # Nobody attends more activities than their capacity.
+    attendance = {p: sum(assigned[(p, s)] for s in slots_of[p]) for p in people}
     for p in people:
-        if capacity[p] > 0:
-            model.add(
-                capacity[p] * min_fulfillment
-                <= _FULLFILLMENT_SCALE * participation_count[p]
-            ).only_enforce_if(person_covered[p])
+        model.add(attendance[p] <= capacity[p])
 
-    model.add(
-        min_fulfillment <= _FULLFILLMENT_SCALE * sum(person_covered[p] for p in people)
-    )
+    # At most one activity per group.
+    for group in groups or ():
+        model.add(sum(selected[s] for s in group) <= 1)
 
     # ==========================================================
-    # Objective helpers
+    # Per-person quantities used by the objectives
     # ==========================================================
 
-    activity_count = sum(activity_selected[s] for s in slots)
+    # Attends at least once.
+    covered = {p: model.new_bool_var(f"covered_{p}") for p in people}
+    for p in people:
+        model.add_max_equality(
+            covered[p], [0] + [assigned[(p, s)] for s in slots_of[p]]
+        )
 
-    coverage_count = sum(person_covered[p] for p in people)
-
-    total_assignments = sum(person_assigned[(p, s)] for p in people for s in slots)
-
-    # ==========================================================
-    # Objective order
-    # ==========================================================
-
-    objective_terms = {
-        "coverage": coverage_count,
-        "minimum_fulfillment": min_fulfillment,
-        "activities": activity_count,
-        "total_assignments": total_assignments,
+    # Best score among the person's assignments (0 if unassigned).
+    best_score = {
+        p: model.new_int_var(0, _MAX_AVAILABILITY_SCORE, f"best_score_{p}")
+        for p in people
     }
+    for p in people:
+        model.add_max_equality(
+            best_score[p],
+            [0] + [score[(p, s)] * assigned[(p, s)] for s in slots_of[p]],
+        )
+
+    # Lowest attendance/capacity ratio among covered people, scaled to an
+    # integer. Only bounded from above, so maximizing makes it exact.
+    min_fulfillment = model.new_int_var(0, _FULFILLMENT_SCALE, "min_fulfillment")
+    for p in people:
+        model.add(
+            capacity[p] * min_fulfillment <= _FULFILLMENT_SCALE * attendance[p]
+        ).only_enforce_if(covered[p])
+    model.add(min_fulfillment <= _FULFILLMENT_SCALE * sum(covered.values()))
+    if "minimum_fulfillment" not in objective_order:
+        # Otherwise it stays free, and enumeration would repeat each schedule
+        # once per possible value.
+        model.add(min_fulfillment == 0)
 
     # ==========================================================
-    # Solve
+    # Objectives, optimized lexicographically in objective_order
     # ==========================================================
+
+    objectives = {
+        "coverage": sum(covered.values()),
+        "best_slot": sum(best_score.values()),
+        "minimum_fulfillment": min_fulfillment,
+        "activities": sum(selected.values()),
+        "total_attendance": sum(assigned.values()),
+        "total_preference": sum(score[key] * assigned[key] for key in assigned),
+    }
 
     solver = cp_model.CpSolver()
     for objective_name in objective_order:
-        objective_term = objective_terms[objective_name]
-        model.maximize(objective_term)
+        objective = objectives[objective_name]
+        model.maximize(objective)
         status = solver.solve(model)
         if status != cp_model.OPTIMAL:
-            return []
-        model.add(objective_term == solver.value(objective_term))
+            # Selecting nothing is always feasible, so this signals a bug or
+            # solver problem rather than an impossible schedule.
+            raise RuntimeError(
+                f"solver returned {solver.status_name(status)} while optimizing "
+                f"{objective_name!r}"
+            )
+        # Keep this optimum fixed while optimizing the next objectives.
+        model.add(objective == solver.value(objective))
 
     # ==========================================================
-    # Return the final result
+    # Results
     # ==========================================================
 
-    make_result = partial(
-        _make_result,
-        slots=slots,
-        people=people,
-        activity_selected=activity_selected,
-        person_assigned=person_assigned,
-        participant_count=participation_count,
-        person_covered=person_covered,
-        min_fulfillment=min_fulfillment,
-        total_assignments=total_assignments,
-    )
+    def extract_participants(value: Callable[..., int]) -> dict[str, list[str]]:
+        return {
+            s: [p for p in people_of[s] if value(assigned[(p, s)])]
+            for s in slots
+            if value(selected[s])
+        }
 
-    if return_all_solutions:
-        return _get_all_solutions(model, make_result, prefer_spread)
+    if not return_all_solutions:
+        participants = extract_participants(solver.value)
+        return [_summarize(participants, capacity, slot_scores)]
 
-    return [make_result(solver.value)]
+    schedules = [
+        _summarize(participants, capacity, slot_scores)
+        for participants in _enumerate_solutions(model, extract_participants)
+    ]
+    if prefer_spread:
+        schedules = _filter_prefer_spread(schedules)
+    return schedules
 
 
 # ==========================================================
@@ -484,50 +549,59 @@ if __name__ == "__main__":
         "Daniel2": 1,
     }
 
-    availability = {
-        "09-06 Fri": frozenset({"Tomas", "Hernan", "Nacho", "Victor"}),
-        "09-07 Sat": frozenset({"Tomas", "Hernan", "Nacho", "Daniel"}),
-        "09-08 Sun": frozenset({"Tomas", "Hernan"}),
-        "09-13 Fri": frozenset({"Tomas", "Hernan", "Nacho", "Victor", "Matteo"}),
-        "09-14 Sat": frozenset({"Tomas", "Nacho"}),
-        "09-15 Sun": frozenset({"Tomas", "Hernan"}),
-        "09-20 Fri": frozenset({"Tomas", "Hernan", "Nacho", "Victor"}),
-        "09-21 Sat": frozenset({"Tomas", "Hernan", "Nacho", "Daniel"}),
-        "09-22 Sun": frozenset({"Tomas", "Hernan"}),
-        "09-27 Fri": frozenset({"Tomas", "Hernan", "Victor"}),
-        "09-28 Sat": frozenset({"Tomas", "Hernan"}),
-        "09-29 Sun": frozenset({"Tomas", "Hernan"}),
+    # fmt:off
+    availability: AvailabilityInput = {
+        "09-06 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 1, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
+        "09-07 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 4, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
+        "09-08 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
+        "09-13 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 4, "Daniel2": 0},
+        "09-14 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 0, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
+        "09-15 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
+        "09-20 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 2, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
+        "09-21 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 4, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
+        "09-22 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
+        "09-27 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
+        "09-28 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
+        "09-29 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
     }
+    # fmt:on
 
     groups = frozenset(
         frozenset(group) for group in zip(*[iter(availability.keys())] * 3)
     )
 
     result = solve_schedule(
-        availability=availability,
-        capacity=capacity,
-        min_people=4,
-        groups=groups,
-        objective_order=(
+        capacity,
+        availability,
+        4,
+        groups,
+        (
             "coverage",
+            "best_slot",
             "minimum_fulfillment",
             "activities",
-            "total_assignments",
+            "total_attendance",
+            "total_preference",
         ),
-        return_all_solutions=True,
-        prefer_spread=True,
+        True,
+        True,
     )
 
     if _VERBOSE:
-        pprint(result)
+        pprint(result, sort_dicts=False)
     else:
-        schedules = result if isinstance(result, list) else [result]
-        if schedules:
+        if result:
             print()
-        for schedule in schedules:
+        for schedule in result:
+            print(
+                f"Coverage: {schedule['coverage_count']}"
+                f"/{schedule['coverage_ideal']}\n"
+                f"Best slot score: {schedule['best_slot_score']}"
+                f"/{schedule['best_slot_ideal']}\n"
+            )
             print(
                 "\n".join(
-                    f"{slot}: {', '.join(p for p in sorted(participants))}"
+                    f"{slot}: {', '.join(sorted(participants))}"
                     for slot, participants in schedule["participants"].items()
                 )
             )
