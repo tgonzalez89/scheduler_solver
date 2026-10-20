@@ -320,8 +320,7 @@ def solve_schedule(
 
     min_people : int
         Minimum number of attendees required for every selected activity. Must
-        be positive and no larger than the number of people with positive
-        capacity.
+        be positive and no larger than the number of people in `capacity`.
 
     groups : frozenset[frozenset[str]] | None
         Optional, disjoint groups of known slots. At most one activity may be
@@ -551,13 +550,13 @@ if __name__ == "__main__":
 
     # fmt:off
     availability: AvailabilityInput = {
-        "09-06 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 1, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
+        "09-06 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
         "09-07 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 4, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
         "09-08 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
         "09-13 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 4, "Daniel2": 0},
         "09-14 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 0, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
         "09-15 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
-        "09-20 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 2, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
+        "09-20 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
         "09-21 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 4, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
         "09-22 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
         "09-27 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
