@@ -60,7 +60,7 @@ class TestObjectives(unittest.TestCase):
             result["participants"],
             {"slot 1": ["A", "B"], "slot 2": ["A", "B"]},
         )
-        self.assertEqual(result["minimum_fulfillment"], 1.0)
+        self.assertEqual(result["minimum_fulfillment"], 100)
 
     def test_metrics_are_reported_for_objectives_not_optimized(self):
         result = self.solve_for_objective(
@@ -73,7 +73,7 @@ class TestObjectives(unittest.TestCase):
         self.assertEqual(
             result["participants"], {"slot 1": ["A", "B"], "slot 2": ["A"]}
         )
-        self.assertEqual(result["minimum_fulfillment"], 0.5)
+        self.assertEqual(result["minimum_fulfillment"], 50)
         self.assertEqual(result["coverage_count"], 2)
         self.assertEqual(result["best_slot_score"], 7)
         self.assertEqual(result["total_preference"], 11)

@@ -1,6 +1,5 @@
 import math
 from collections.abc import Callable
-from pprint import pprint
 from typing import Any, Literal, get_args
 
 from ortools.sat.python import cp_model
@@ -10,7 +9,6 @@ from ortools.sat.python import cp_model
 # ==========================================================
 
 
-_VERBOSE = True
 _MAX_AVAILABILITY_SCORE = 4
 ObjectiveName = Literal[
     "coverage",
@@ -20,6 +18,8 @@ ObjectiveName = Literal[
     "total_attendance",
     "total_preference",
 ]
+_VALID_OBJECTIVES = get_args(ObjectiveName)
+DEFAULT_OBJECTIVE_ORDER = _VALID_OBJECTIVES
 # Per slot, either {person: score} or a frozenset of people who all get the top
 # score.
 AvailabilityInput = dict[str, dict[str, int] | frozenset[str]]
@@ -128,15 +128,14 @@ def _validate_groups(
 def _validate_objective_order(
     objective_order: tuple[ObjectiveName, ...],
 ) -> None:
-    valid_objectives = get_args(ObjectiveName)
     if (
         not objective_order
         or len(objective_order) != len(set(objective_order))
-        or not set(objective_order).issubset(valid_objectives)
+        or not set(objective_order).issubset(_VALID_OBJECTIVES)
     ):
         raise ValueError(
             "objective_order must contain one or more unique objectives from "
-            f"{', '.join(map(repr, valid_objectives))}"
+            f"{', '.join(map(repr, _VALID_OBJECTIVES))}"
         )
 
 
@@ -281,14 +280,7 @@ def solve_schedule(
     availability: AvailabilityInput,
     min_people: int,
     groups: frozenset[frozenset[str]] | None = None,
-    objective_order: tuple[ObjectiveName, ...] = (
-        "coverage",
-        "best_slot",
-        "minimum_fulfillment",
-        "activities",
-        "total_attendance",
-        "total_preference",
-    ),
+    objective_order: tuple[ObjectiveName, ...] = DEFAULT_OBJECTIVE_ORDER,
     return_all_solutions: bool = True,
     prefer_spread: bool = True,
 ) -> list[dict[str, Any]]:
@@ -535,79 +527,3 @@ def solve_schedule(
     if prefer_spread:
         schedules = _filter_prefer_spread(schedules)
     return schedules
-
-
-# ==========================================================
-# Main
-# ==========================================================
-
-
-if __name__ == "__main__":
-    capacity = {
-        "Tomas": 3,
-        "Victor": 3,
-        "Daniel": 2,
-        "Hernan": 2,
-        "Jose": 2,
-        "Nacho": 2,
-        "Matteo": 1,
-        "Daniel2": 1,
-    }
-
-    # fmt:off
-    availability: AvailabilityInput = {
-        "09-06 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
-        "09-07 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 4, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
-        "09-08 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
-        "09-13 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 4, "Daniel2": 0},
-        "09-14 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 0, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
-        "09-15 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
-        "09-20 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
-        "09-21 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 4, "Hernan": 4, "Jose": 0, "Nacho": 4, "Matteo": 0, "Daniel2": 0},
-        "09-22 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
-        "09-27 Fri": {"Tomas": 4, "Victor": 4, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
-        "09-28 Sat": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
-        "09-29 Sun": {"Tomas": 4, "Victor": 0, "Daniel": 0, "Hernan": 4, "Jose": 0, "Nacho": 0, "Matteo": 0, "Daniel2": 0},
-    }
-    # fmt:on
-
-    groups = frozenset(
-        frozenset(group) for group in zip(*[iter(availability.keys())] * 3)
-    )
-
-    result = solve_schedule(
-        capacity,
-        availability,
-        4,
-        groups,
-        (
-            "coverage",
-            "best_slot",
-            "minimum_fulfillment",
-            "activities",
-            "total_attendance",
-            "total_preference",
-        ),
-        True,
-        True,
-    )
-
-    if _VERBOSE:
-        pprint(result, sort_dicts=False)
-    else:
-        if result:
-            print()
-        for schedule in result:
-            print(
-                f"Coverage: {schedule['coverage_count']}"
-                f"/{schedule['coverage_ideal']}\n"
-                f"Best slot score: {schedule['best_slot_score']}"
-                f"/{schedule['best_slot_ideal']}\n"
-            )
-            print(
-                "\n".join(
-                    f"{slot}: {', '.join(sorted(participants))}"
-                    for slot, participants in schedule["participants"].items()
-                )
-            )
-            print()
