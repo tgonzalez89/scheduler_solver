@@ -99,6 +99,21 @@ class TestObjectives(unittest.TestCase):
         # min_people=2 forces A and B together, so the real schedule falls short.
         self.assertLess(result["total_preference"], 11)
 
+    def test_minimum_fulfillment_distinguishes_close_ratios(self):
+        # 1/39 and 1/40 differ by less than 1/1000, so a fixed scale of 1000
+        # would round both down to 25 and report a tie.
+        result = solve_schedule(
+            capacity={"P": 39, "Q": 40},
+            availability={"slot P": {"P": 4}, "slot Q": {"Q": 4}},
+            min_people=1,
+            groups=frozenset({frozenset({"slot P", "slot Q"})}),
+            objective_order=("minimum_fulfillment",),
+            prefer_spread=False,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["participants"], {"slot P": ["P"]})
+
     def test_maximize_activities(self):
         result = self.solve_for_objective(
             "activities",

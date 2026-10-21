@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 from pprint import pprint
 from typing import Any, Literal, get_args
@@ -9,8 +10,7 @@ from ortools.sat.python import cp_model
 # ==========================================================
 
 
-_VERBOSE = False
-_FULFILLMENT_SCALE = 1000
+_VERBOSE = True
 _MAX_AVAILABILITY_SCORE = 4
 ObjectiveName = Literal[
     "coverage",
@@ -215,7 +215,7 @@ def _summarize(
         ),
         **_ideal_metrics(capacity, availability),
         "minimum_fulfillment": min(
-            (attendance[person] / capacity[person] for person in covered),
+            (100 * attendance[person] // capacity[person] for person in covered),
             default=0.0,
         ),
         "activity_count": len(participants),
@@ -466,14 +466,20 @@ def solve_schedule(
             [0] + [score[(p, s)] * assigned[(p, s)] for s in slots_of[p]],
         )
 
-    # Lowest attendance/capacity ratio among covered people, scaled to an
-    # integer. Only bounded from above, so maximizing makes it exact.
-    min_fulfillment = model.new_int_var(0, _FULFILLMENT_SCALE, "min_fulfillment")
+    # Lowest attendance/capacity ratio among covered people. CP-SAT only
+    # supports integers, so the ratio is stored multiplied by `scale`. Using
+    # the LCM of all capacities makes every possible ratio attendance/capacity
+    # a whole number of 1/scale units, so no ratio is rounded and two different
+    # ratios never look equal. A fixed scale like 1000 would round ratios down
+    # and could tie distinct ones once capacities get large.
+    # Only bounded from above, so maximizing makes it exact.
+    scale = math.lcm(*(c for c in capacity.values() if c > 0))
+    min_fulfillment = model.new_int_var(0, scale, "min_fulfillment")
     for p in people:
         model.add(
-            capacity[p] * min_fulfillment <= _FULFILLMENT_SCALE * attendance[p]
+            capacity[p] * min_fulfillment <= scale * attendance[p]
         ).only_enforce_if(covered[p])
-    model.add(min_fulfillment <= _FULFILLMENT_SCALE * sum(covered.values()))
+    model.add(min_fulfillment <= scale * sum(covered.values()))
     if "minimum_fulfillment" not in objective_order:
         # Otherwise it stays free, and enumeration would repeat each schedule
         # once per possible value.
